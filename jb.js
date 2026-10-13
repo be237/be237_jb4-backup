@@ -112,6 +112,8 @@ const SYS = {
   getpid: 20,
   getuid: 0x18,
   close: 6,
+  open: 5,
+  read: 3,
   socket: 97,
   socketpair: 0x87,
   getsockopt: 118,
@@ -540,12 +542,54 @@ let allDone = false,
       const a = new int64(r.lo, r.hi);
       return a.hi === 0 && a.low === 0 ? -1 : p.read4(a) | 0;
     }
+    // USB fallback: read a file from an inserted flash drive via raw syscalls.
+    // Only usable AFTER the sandbox escape (post-kpatch); returns null on any
+    // failure so callers can fall back to the network blob.
+    function readUsbFileSync(relPath, maxBytes) {
+      try {
+        if (!stubAddr.has(SYS.open) || !stubAddr.has(SYS.read)) return null;
+        const path = "/mnt/usb0/" + relPath;
+        const pathAb = new ArrayBuffer(path.length + 1);
+        keepAlive.push(pathAb);
+        const pathU8 = new Uint8Array(pathAb);
+        for (let i = 0; i < path.length; i++) pathU8[i] = path.charCodeAt(i);
+        const fd = sc(SYS.open, bufAddr(pathAb), 0, 0).i32;
+        if (fd < 0) return null;
+        const cap = Math.min(maxBytes || 0x80000, 0x80000);
+        const bufAb = new ArrayBuffer(cap);
+        keepAlive.push(bufAb);
+        let total = 0;
+        for (;;) {
+          const n = sc(SYS.read, fd, bufAddr(bufAb).add32(total), cap - total)
+            .i32;
+          if (n <= 0) break;
+          total += n;
+          if (total >= cap) break;
+        }
+        sc(SYS.close, fd);
+        if (total <= 0) return null;
+        return new Uint8Array(bufAb.slice(0, total));
+      } catch (e) {
+        return null;
+      }
+    }
     async function relaunchPayload() {
       let blob = null;
       try {
         const r = await fetch(PAYLOAD_FILE);
         if (r.ok) blob = new Uint8Array(await r.arrayBuffer());
       } catch (e) {}
+      if (!blob || blob[0] !== 0xe9) {
+        // Network unusable -> try the flash drive (mounted at /mnt/usb0).
+        // Accept either "payload.bin" or "goldhen.bin" on the root of the USB.
+        const usb =
+          readUsbFileSync("payload.bin", 0x80000) ||
+          readUsbFileSync("goldhen.bin", 0x80000);
+        if (usb && usb[0] === 0xe9) {
+          blob = usb;
+          mark("JB-RELAUNCH", "USB fallback blob=ok bytes=" + usb.length);
+        }
+      }
       if (!blob || blob[0] !== 0xe9) {
         mark("JB-RELAUNCH", "file=" + PAYLOAD_FILE + " blob=unusable");
         return;
@@ -3463,6 +3507,21 @@ let allDone = false,
                     }
                   }
                 }
+              }
+            }
+
+            // Late USB fallback: the network payloadBlob was fetched BEFORE the
+            // sandbox escape (pre-JB). Now that the kernel is patched we can read
+            // a flash drive. Only used if the network blob was missing/unusable.
+            if (kpDone && DO_PAYLOAD && (!payloadBlob || payloadBlob[0] !== 0xe9)) {
+              const usb =
+                readUsbFileSync("payload.bin", 0x80000) ||
+                readUsbFileSync("goldhen.bin", 0x80000);
+              if (usb && usb[0] === 0xe9) {
+                payloadBlob = usb;
+                mark("PAYLOAD-USB", "fallback ok bytes=" + usb.length);
+              } else {
+                mark("PAYLOAD-USB", "no usable blob on /mnt/usb0");
               }
             }
 
